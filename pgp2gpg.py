@@ -10,6 +10,8 @@ import sys
 import subprocess
 import argparse
 import logging
+import shutil
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 from datetime import datetime
@@ -44,9 +46,10 @@ class ErrorTracker:
         self.warnings.append(warning_entry)
         logger.warning(message)
 
+    @property
     def has_errors(self) -> bool:
         """Check if any errors were recorded."""
-        return len(self.errors) > 0
+        return bool(self.errors)
 
     def print_summary(self):
         """Print a summary of all errors and warnings."""
@@ -67,7 +70,7 @@ class ErrorTracker:
                     print(f"   Exception: {error['exception']}")
 
         if not self.errors and not self.warnings:
-            print("\n[OK] No errors or warnings recorded")
+            print("\nNo errors or warnings recorded")
 
 
 # Configure logging
@@ -107,6 +110,48 @@ def setup_logging(verbose: bool = False, log_file: Optional[str] = None):
 logger = logging.getLogger(__name__)
 
 
+def find_executable(exe_names: List[str], custom_path: Optional[str] = None,
+                   tool_name: str = "executable") -> Optional[str]:
+    """
+    Find an executable by searching common names.
+
+    Args:
+        exe_names: List of executable names to try (e.g., ['gpg', 'gpg.exe'])
+        custom_path: Optional custom path to check first
+        tool_name: Name of tool for logging (e.g., "PGP", "GPG")
+
+    Returns:
+        Path to executable if found, None otherwise
+    """
+    if custom_path:
+        if os.path.isfile(custom_path):
+            logger.info(f"Using custom {tool_name} executable: {custom_path}")
+            return custom_path
+        else:
+            logger.warning(f"Custom {tool_name} path not found: {custom_path}")
+
+    for exe_name in exe_names:
+        try:
+            result = subprocess.run(
+                ['which', exe_name] if os.name != 'nt' else ['where', exe_name],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                found_path = result.stdout.strip().split('\n')[0]
+                logger.info(f"Found {tool_name} executable: {found_path}")
+                return found_path
+        except subprocess.TimeoutExpired:
+            logger.debug(f"Timeout while searching for {exe_name}")
+        except FileNotFoundError:
+            logger.debug(f"Command not found while searching for {exe_name}")
+        except Exception as e:
+            logger.debug(f"Error searching for {exe_name}: {e}")
+
+    return None
+
+
 class PGPKeyExporter:
     """Handles exporting keys from PGP Desktop."""
 
@@ -139,35 +184,10 @@ class PGPKeyExporter:
 
     def _find_pgp_executable(self, custom_path: Optional[str] = None) -> Optional[str]:
         """Find the PGP executable."""
-        if custom_path:
-            if os.path.isfile(custom_path):
-                logger.info(f"Using custom PGP executable: {custom_path}")
-                return custom_path
-            else:
-                self.error_tracker.add_warning(f"Custom PGP path not found: {custom_path}")
-
-        # Try common executable names
-        for exe_name in ['pgp', 'pgp.exe']:
-            try:
-                result = subprocess.run(
-                    ['which', exe_name] if os.name != 'nt' else ['where', exe_name],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    found_path = result.stdout.strip().split('\n')[0]
-                    logger.info(f"Found PGP executable: {found_path}")
-                    return found_path
-            except subprocess.TimeoutExpired:
-                self.error_tracker.add_warning(f"Timeout while searching for {exe_name}")
-            except FileNotFoundError:
-                logger.debug(f"Command not found while searching for {exe_name}")
-            except Exception as e:
-                self.error_tracker.add_warning(f"Error searching for {exe_name}: {e}")
-
-        self.error_tracker.add_warning("PGP executable not found in PATH")
-        return None
+        pgp_exe = find_executable(['pgp', 'pgp.exe'], custom_path, "PGP")
+        if not pgp_exe:
+            self.error_tracker.add_warning("PGP executable not found in PATH")
+        return pgp_exe
 
     def _find_keyring_path(self, custom_path: Optional[str] = None) -> Optional[Path]:
         """Find the PGP keyring directory."""
@@ -289,7 +309,7 @@ class PGPKeyExporter:
                 )
                 return False
 
-            logger.info(f"SUCCESS: Public keys exported to: {public_file} ({public_file.stat().st_size} bytes)")
+            logger.info(f"Public keys exported to: {public_file} ({public_file.stat().st_size} bytes)")
 
             # Export private keys if requested
             if private_file:
@@ -309,14 +329,11 @@ class PGPKeyExporter:
 
                 # Add passphrase if provided
                 env = os.environ.copy()
-                stdin_input = None
                 if self.passphrase:
-                    # Different PGP implementations handle passphrases differently
-                    # Try common options
-                    cmd.extend(['--passphrase', self.passphrase])
+                    # Use environment variable to avoid exposing passphrase in process listing
                     env['PGPPASSPHRASE'] = self.passphrase
 
-                logger.debug(f"Running command: {' '.join([c if c != self.passphrase else '***' for c in cmd])}")
+                logger.debug(f"Running command: {' '.join(cmd)}")
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
 
                 if result.returncode != 0:
@@ -326,7 +343,7 @@ class PGPKeyExporter:
                     self.error_tracker.add_error(error_msg)
                 else:
                     if private_file.exists() and private_file.stat().st_size > 0:
-                        logger.info(f"SUCCESS: Private keys exported to: {private_file} ({private_file.stat().st_size} bytes)")
+                        logger.info(f"Private keys exported to: {private_file} ({private_file.stat().st_size} bytes)")
                     else:
                         self.error_tracker.add_warning(
                             f"Private key export command succeeded but file is missing or empty: {private_file}"
@@ -355,9 +372,6 @@ class PGPKeyExporter:
         Returns:
             True if conversion succeeded
         """
-        import tempfile
-        import shutil
-
         temp_home = None
         try:
             # Find GPG executable
@@ -373,7 +387,7 @@ class PGPKeyExporter:
                     if result.returncode == 0 and result.stdout.strip():
                         gpg_cmd = result.stdout.strip().split('\n')[0]
                         break
-                except:
+                except Exception:
                     continue
 
             if not gpg_cmd:
@@ -437,7 +451,7 @@ class PGPKeyExporter:
 
             if export_result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
                 size = output_file.stat().st_size
-                logger.info(f"SUCCESS: Converted {keyring_file.name} to ASCII armored format: {output_file} ({size} bytes)")
+                logger.info(f"Converted {keyring_file.name} to ASCII armored format: {output_file} ({size} bytes)")
                 return True
             else:
                 logger.debug(f"GPG export failed: {export_result.stderr}")
@@ -458,6 +472,51 @@ class PGPKeyExporter:
                 except Exception as e:
                     logger.debug(f"Failed to clean up temporary directory: {e}")
 
+    def _export_single_keyring(self, keyring_file: Path, output_dir: Path,
+                               ascii_filename: str, binary_filename: str,
+                               is_secret: bool, key_type: str) -> Optional[Path]:
+        """
+        Export a single keyring file with ASCII conversion fallback.
+
+        Args:
+            keyring_file: Source PGP keyring file
+            output_dir: Destination directory
+            ascii_filename: Filename for ASCII armored output
+            binary_filename: Filename for binary fallback
+            is_secret: Whether this is a secret keyring
+            key_type: Description for logging (e.g., "public", "private")
+
+        Returns:
+            Path to exported file if successful, None otherwise
+        """
+        if not keyring_file.exists():
+            if is_secret:
+                self.error_tracker.add_warning(f"{key_type.capitalize()} keyring file not found: {keyring_file}")
+            else:
+                self.error_tracker.add_error(f"{key_type.capitalize()} keyring file not found: {keyring_file}")
+            return None
+
+        # Try ASCII conversion first
+        ascii_output = output_dir / ascii_filename
+        if self._convert_keyring_with_gpg(keyring_file, ascii_output, is_secret=is_secret):
+            return ascii_output
+
+        # Fall back to binary copy
+        logger.info("GPG conversion failed, falling back to binary copy")
+        try:
+            binary_out = output_dir / binary_filename
+            shutil.copy2(keyring_file, binary_out)
+            size = binary_out.stat().st_size
+            logger.info(f"Copied {key_type} keyring to: {binary_out} ({size} bytes)")
+            self.error_tracker.add_warning(
+                f"Could not convert to ASCII format - copied binary keyring. "
+                "GPG may have trouble importing this format."
+            )
+            return binary_out
+        except Exception as e:
+            self.error_tracker.add_error(f"Failed to copy {key_type} keyring from {keyring_file}", e)
+            return None
+
     def _export_keyring_files(self, output_dir: Path, export_private: bool) -> Tuple[Optional[Path], Optional[Path]]:
         """
         Export keyring files, attempting conversion to ASCII armored format.
@@ -473,59 +532,19 @@ class PGPKeyExporter:
         public_keyring = self.keyring_path / 'pubring.pkr'
         private_keyring = self.keyring_path / 'secring.skr'
 
-        public_out = None
+        public_out = self._export_single_keyring(
+            public_keyring, output_dir,
+            'pgp_public_keys.asc', 'pubring.pkr',
+            is_secret=False, key_type="public"
+        )
+
         private_out = None
-
-        # Export public keyring
-        if public_keyring.exists():
-            # Try ASCII conversion first
-            ascii_output = output_dir / 'pgp_public_keys.asc'
-            if self._convert_keyring_with_gpg(public_keyring, ascii_output, is_secret=False):
-                public_out = ascii_output
-            else:
-                # Fall back to binary copy
-                logger.info("GPG conversion failed, falling back to binary copy")
-                try:
-                    public_out = output_dir / 'pubring.pkr'
-                    import shutil
-                    shutil.copy2(public_keyring, public_out)
-                    size = public_out.stat().st_size
-                    logger.info(f"SUCCESS: Copied public keyring to: {public_out} ({size} bytes)")
-                    self.error_tracker.add_warning(
-                        f"Could not convert to ASCII format - copied binary keyring. "
-                        "GPG may have trouble importing this format."
-                    )
-                except Exception as e:
-                    self.error_tracker.add_error(f"Failed to copy public keyring from {public_keyring}", e)
-                    public_out = None
-        else:
-            self.error_tracker.add_error(f"Public keyring file not found: {public_keyring}")
-
-        # Export private keyring
         if export_private:
-            if private_keyring.exists():
-                # Try ASCII conversion first
-                ascii_output = output_dir / 'pgp_private_keys.asc'
-                if self._convert_keyring_with_gpg(private_keyring, ascii_output, is_secret=True):
-                    private_out = ascii_output
-                else:
-                    # Fall back to binary copy
-                    logger.info("GPG conversion failed, falling back to binary copy")
-                    try:
-                        private_out = output_dir / 'secring.skr'
-                        import shutil
-                        shutil.copy2(private_keyring, private_out)
-                        size = private_out.stat().st_size
-                        logger.info(f"SUCCESS: Copied private keyring to: {private_out} ({size} bytes)")
-                        self.error_tracker.add_warning(
-                            f"Could not convert to ASCII format - copied binary keyring. "
-                            "GPG may have trouble importing this format."
-                        )
-                    except Exception as e:
-                        self.error_tracker.add_error(f"Failed to copy private keyring from {private_keyring}", e)
-                        private_out = None
-            else:
-                self.error_tracker.add_warning(f"Private keyring file not found: {private_keyring}")
+            private_out = self._export_single_keyring(
+                private_keyring, output_dir,
+                'pgp_private_keys.asc', 'secring.skr',
+                is_secret=True, key_type="private"
+            )
 
         return (public_out, private_out)
 
@@ -549,34 +568,7 @@ class GPGKeyImporter:
 
     def _find_gpg_executable(self, custom_path: Optional[str] = None) -> Optional[str]:
         """Find the GPG executable."""
-        if custom_path:
-            if os.path.isfile(custom_path):
-                logger.info(f"Using custom GPG executable: {custom_path}")
-                return custom_path
-            else:
-                self.error_tracker.add_warning(f"Custom GPG path not found: {custom_path}")
-
-        # Try common executable names
-        for exe_name in ['gpg', 'gpg.exe', 'gpg2', 'gpg2.exe']:
-            try:
-                result = subprocess.run(
-                    ['which', exe_name] if os.name != 'nt' else ['where', exe_name],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    found_path = result.stdout.strip().split('\n')[0]
-                    logger.info(f"Found GPG executable: {found_path}")
-                    return found_path
-            except subprocess.TimeoutExpired:
-                logger.debug(f"Timeout while searching for {exe_name}")
-            except FileNotFoundError:
-                logger.debug(f"Command not found while searching for {exe_name}")
-            except Exception as e:
-                logger.debug(f"Error searching for {exe_name}: {e}")
-
-        return None
+        return find_executable(['gpg', 'gpg.exe', 'gpg2', 'gpg2.exe'], custom_path, "GPG")
 
     def get_existing_key_ids(self, secret_keys: bool = False) -> set:
         """
@@ -626,7 +618,7 @@ class GPGKeyImporter:
             logger.debug(f"Error getting existing key IDs: {e}")
             return set()
 
-    def extract_key_ids_from_file(self, key_file: Path) -> set:
+    def extract_key_ids_from_file(self, key_file: Path) -> tuple[set, bool]:
         """
         Extract key IDs (fingerprints) from a key file.
 
@@ -634,7 +626,8 @@ class GPGKeyImporter:
             key_file: Path to the key file
 
         Returns:
-            Set of key IDs found in the file
+            Tuple of (key_ids, has_secret_keys) where has_secret_keys indicates
+            if the file contains secret keys
         """
         try:
             cmd = [
@@ -652,9 +645,10 @@ class GPGKeyImporter:
                 timeout=60
             )
 
-            # Parse output to extract fingerprints
+            # Parse output to extract fingerprints and detect key types
             key_ids = set()
             key_info = []
+            has_secret_keys = False
 
             for line in result.stdout.split('\n'):
                 if line.startswith('fpr:'):
@@ -662,43 +656,31 @@ class GPGKeyImporter:
                     parts = line.split(':')
                     if len(parts) >= 10 and parts[9]:
                         key_ids.add(parts[9])
-                elif line.startswith('pub:') or line.startswith('sec:'):
+                elif line.startswith('sec:'):
+                    has_secret_keys = True
                     # Extract key info for logging
                     parts = line.split(':')
                     if len(parts) >= 5:
-                        key_type = 'Secret' if line.startswith('sec:') else 'Public'
                         key_id = parts[4][-16:] if len(parts[4]) >= 16 else parts[4]
-                        key_info.append(f"{key_type} key {key_id}")
+                        key_info.append(f"Secret key {key_id}")
+                elif line.startswith('pub:'):
+                    # Extract key info for logging
+                    parts = line.split(':')
+                    if len(parts) >= 5:
+                        key_id = parts[4][-16:] if len(parts[4]) >= 16 else parts[4]
+                        key_info.append(f"Public key {key_id}")
 
             if key_info:
                 logger.debug(f"Found in file: {', '.join(key_info)}")
 
-            return key_ids
+            return (key_ids, has_secret_keys)
 
         except subprocess.TimeoutExpired:
             logger.debug(f"Timeout while extracting keys from {key_file}")
-            return set()
+            return (set(), False)
         except Exception as e:
             logger.debug(f"Error extracting key IDs from file: {e}")
-            return set()
-
-    def check_for_duplicates(self, key_file: Path, check_secret: bool = False) -> tuple[set, set]:
-        """
-        Check if keys in the file already exist in GPG.
-
-        Args:
-            key_file: Path to the key file to check
-            check_secret: Whether to check secret keys
-
-        Returns:
-            Tuple of (keys_in_file, existing_keys)
-        """
-        keys_in_file = self.extract_key_ids_from_file(key_file)
-        existing_keys = self.get_existing_key_ids(secret_keys=check_secret)
-
-        duplicates = keys_in_file & existing_keys
-
-        return (keys_in_file, duplicates)
+            return (set(), False)
 
     def import_keys(self, key_file: Path, skip_existing: bool = False) -> bool:
         """
@@ -730,8 +712,9 @@ class GPGKeyImporter:
             # Check for duplicates if requested
             if skip_existing:
                 logger.info("Checking for existing keys in GPG keyring...")
-                is_secret_key = 'private' in key_file.name.lower() or 'secret' in key_file.name.lower()
-                keys_in_file, duplicates = self.check_for_duplicates(key_file, check_secret=is_secret_key)
+                keys_in_file, has_secret_keys = self.extract_key_ids_from_file(key_file)
+                existing_keys = self.get_existing_key_ids(secret_keys=has_secret_keys)
+                duplicates = keys_in_file & existing_keys
 
                 if duplicates:
                     logger.info(f"Found {len(duplicates)} key(s) that already exist in GPG:")
@@ -739,7 +722,7 @@ class GPGKeyImporter:
                         logger.info(f"  - {key_id}")
 
                     if len(duplicates) == len(keys_in_file):
-                        logger.info("SUCCESS: All keys already exist in GPG keyring - skipping import")
+                        logger.info("All keys already exist in GPG keyring - skipping import")
                         self.error_tracker.add_warning(
                             f"Skipped import of {key_file.name} - all {len(duplicates)} key(s) already exist"
                         )
@@ -753,7 +736,7 @@ class GPGKeyImporter:
                 else:
                     logger.info(f"No duplicate keys found - proceeding with import of {len(keys_in_file)} key(s)")
 
-            cmd = [self.gpg_executable, '--import', str(key_file)]
+            cmd = [self.gpg_executable, '--import', '--import-options', 'import-show', str(key_file)]
             logger.debug(f"Running command: {' '.join(cmd)}")
 
             result = subprocess.run(
@@ -768,30 +751,19 @@ class GPGKeyImporter:
                 logger.info(f"GPG import output:\n{result.stderr}")
 
             if result.returncode == 0:
-                # Parse stderr to count imported keys
-                imported_count = 0
-                unchanged_count = 0
-                updated_count = 0
+                # Count import results using status output
+                imported_count = result.stderr.count('gpg: key ') - result.stderr.count('not changed')
+                unchanged_count = result.stderr.count('not changed')
 
-                for line in result.stderr.split('\n'):
-                    if 'imported:' in line.lower():
-                        # Extract count: "gpg: Total number processed: 5"
-                        parts = line.split(':')
-                        if len(parts) >= 2:
-                            try:
-                                imported_count = int(parts[-1].strip().split()[0])
-                            except (ValueError, IndexError):
-                                pass
-                    elif 'unchanged:' in line.lower():
-                        try:
-                            unchanged_count = int(line.split(':')[-1].strip().split()[0])
-                        except (ValueError, IndexError):
-                            pass
-                    elif 'new key ids' in line.lower() or 'updated' in line.lower():
-                        try:
-                            updated_count = int(line.split(':')[-1].strip().split()[0])
-                        except (ValueError, IndexError):
-                            pass
+                # Estimate updated keys (keys imported but not new)
+                processed_line = [line for line in result.stderr.split('\n') if 'Total number processed:' in line]
+                updated_count = 0
+                if processed_line:
+                    try:
+                        total = int(processed_line[0].split(':')[-1].strip())
+                        updated_count = max(0, total - imported_count - unchanged_count)
+                    except (ValueError, IndexError):
+                        pass
 
                 # Build success message
                 status_parts = []
@@ -803,9 +775,9 @@ class GPGKeyImporter:
                     status_parts.append(f"{unchanged_count} unchanged")
 
                 if status_parts:
-                    logger.info(f"SUCCESS: Keys processed: {', '.join(status_parts)}")
+                    logger.info(f"Keys processed: {', '.join(status_parts)}")
                 else:
-                    logger.info("SUCCESS: Keys imported successfully into GPG")
+                    logger.info("Keys imported successfully into GPG")
 
                 return True
             else:
@@ -991,7 +963,7 @@ Examples:
 
             # Print error summary
             error_tracker.print_summary()
-            sys.exit(0 if success and not error_tracker.has_errors() else 1)
+            sys.exit(0 if success and not error_tracker.has_errors else 1)
 
         # Export keys from PGP
         logger.info("=" * 70)
@@ -1016,7 +988,7 @@ Examples:
         if args.export_only:
             logger.info(f"Exported keys saved to: {output_dir}")
             error_tracker.print_summary()
-            sys.exit(0 if not error_tracker.has_errors() else 1)
+            sys.exit(0 if not error_tracker.has_errors else 1)
 
         # Import keys into GPG
         logger.info("\n" + "=" * 70)
@@ -1038,9 +1010,9 @@ Examples:
         # Print error summary
         error_tracker.print_summary()
 
-        if import_success and not error_tracker.has_errors():
+        if import_success and not error_tracker.has_errors:
             logger.info("\n" + "=" * 70)
-            logger.info("SUCCESS: Migration completed successfully!")
+            logger.info("Migration completed successfully")
             logger.info("=" * 70)
             if args.list_keys:
                 importer.list_keys()
